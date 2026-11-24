@@ -1,0 +1,94 @@
+# 公开站发布（HackerShelf Phase 6）：推送 site/ 或每天定时，先生成新鲜书架 site/fresh.json，再发布到 GitHub Pages。
+# 源码在私有仓库，这里只有构建产物（site/）和生成新鲜书架的脚本（scripts/）。
+name: Pages
+# 定时触发的那次，标题写上是哪条 cron，方便核对实际触发时间（私有仓库的 deploy/public/schedule-log.mjs 汇总）
+run-name: ${{ github.event_name == 'schedule' && format('定时 {0}', github.event.schedule) || github.event.head_commit.message || github.event_name }}
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # 每天两次（D47）：北京时间 05:23（UTC 21:23）和 13:41（UTC 05:41）。arXiv 的 RSS 每天北京 13:10 左右才更新，
+    # 第二次是为了当天中午就能看到 arXiv 的新论文。GitHub 的定时任务常会晚几个小时，偶尔漏跑
+    # （2026-11-05：05:23 那次 09:31 才触发，13:41 那次到 19:50 还没触发）。
+    # 公开仓库 60 天没有提交，GitHub 会停掉定时任务。每月的目录更新会带来提交；停了在 Actions 页面点一下就能恢复，
+    # 或者运行 gh workflow enable Pages --repo john-liu-dev/shelf。
+    - cron: "23 21 * * *"
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # 重跑同一个 workflow 时，前一次上传的产物可能仍在。
+      PAGES_ARTIFACT: github-pages-${{ github.run_attempt }}
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: 新鲜书架（只抓元数据，不调用模型；失败时沿用线上那份）
+        run: node scripts/fresh.mjs --site site --prev https://john-liu-dev.github.io/shelf/fresh.json
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          name: ${{ env.PAGES_ARTIFACT }}
+          path: site
+      - name: 等待 Pages 部署能查到本次上传的产物
+        uses: actions/github-script@v9
+        with:
+          script: |
+            // deploy-pages v5 通过 Actions Results 的 ListArtifacts 查找当前运行的产物。
+            const token = process.env.ACTIONS_RUNTIME_TOKEN
+            const claims = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString())
+            const scope = claims.scp?.match(/(?:^| )Actions\.Results:([^: ]+):([^: ]+)(?: |$)/)
+            if (!scope) throw new Error('Actions Results token 缺少运行范围')
+            const url = new URL('/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts', process.env.ACTIONS_RESULTS_URL)
+            const request = {
+              method: 'POST',
+              headers: {Authorization: `Bearer ${token}`, 'Content-Type': 'application/json'},
+              body: JSON.stringify({workflow_run_backend_id: scope[1], workflow_job_run_backend_id: scope[2]}),
+              redirect: 'error'
+            }
+            const name = process.env.PAGES_ARTIFACT
+            for (const delay of [0, 2, 4, 8, 16, 30]) {
+              if (delay) await new Promise(resolve => setTimeout(resolve, delay * 1000))
+              let response, result
+              try {
+                response = await fetch(url, {...request, signal: AbortSignal.timeout(10000)})
+                if (response.ok) result = await response.json()
+              } catch (error) {
+                if (error instanceof SyntaxError) throw new Error('ListArtifacts 响应不是有效的 JSON')
+                core.info(`ListArtifacts 请求失败（${error.name}）`)
+                continue
+              }
+              if (response.status === 408 || response.status === 429 || response.status >= 500) {
+                core.info(`ListArtifacts 返回 HTTP ${response.status}`)
+                continue
+              }
+              if (!response.ok) throw new Error(`ListArtifacts 返回 HTTP ${response.status}`)
+              const {artifacts = []} = result
+              const matches = artifacts.filter(artifact => artifact.name === name)
+              if (matches.length === 1) return
+              if (matches.length > 1) throw new Error(`存在多个同名产物 ${name}`)
+              core.info(`本次产物 ${name} 暂不可见`)
+            }
+            throw new Error(`查询 6 次仍无法确认产物 ${name}，部署未开始`)
+      - id: deployment
+        uses: actions/deploy-pages@v5
+        with:
+          artifact_name: ${{ env.PAGES_ARTIFACT }}
